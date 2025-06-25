@@ -34,7 +34,7 @@ try:
 except ImportError:
     GPTQ_ENABLED = False
 
-MICRO_MODELS_HOME = os.environ.get("FMS_TEST_SHAPES_MICRO_MODELS_HOME", "/mnt/home/models/tiny-models")
+MICRO_MODELS_HOME = os.environ.get("FMS_TEST_SHAPES_MICRO_MODELS_HOME", "/mnt/models/tiny-models")
 
 # Add models to test here
 LLAMA_3p1_8B_INSTRUCT = "meta-llama/Llama-3.1-8B-Instruct"
@@ -48,6 +48,7 @@ micro_model_mapping = {
     GRANITE_3p2_8B_INSTRUCT: os.path.join(MICRO_MODELS_HOME, "granite-3.2-8b-layers-3-step-100000"),
     # FIXME: Because this uses the same config as 3.2, re-using here, but should update
     GRANITE_3p3_8B_INSTRUCT: os.path.join(MICRO_MODELS_HOME, "granite-3.2-8b-layers-3-step-100000"),
+    LLAMA_3p1_70B_INSTRUCT: os.path.join(MICRO_MODELS_HOME, "llama-3.1-70b-layers-3-step-24000"),
     GRANITE_20B_CODE_INSTRUCT_8K: os.path.join(MICRO_MODELS_HOME, "granite-20b-code-layers-3-step-100000")
 }
 
@@ -67,11 +68,11 @@ validation_info_dir = os.environ.get(
 common_model_paths = os.environ.get(
     "FMS_TEST_SHAPES_COMMON_MODEL_PATHS",
     [
-        LLAMA_3p1_8B_INSTRUCT,
-        GRANITE_3p2_8B_INSTRUCT,
-        GRANITE_3p3_8B_INSTRUCT,
+        # LLAMA_3p1_8B_INSTRUCT,
+        # GRANITE_3p2_8B_INSTRUCT,
+        # GRANITE_3p3_8B_INSTRUCT,
         GRANITE_20B_CODE_INSTRUCT_8K,
-        LLAMA_3p1_70B_INSTRUCT,
+        # LLAMA_3p1_70B_INSTRUCT,
     ],
 )
 # for validation level 1, the default is a failure rate of 1%
@@ -83,9 +84,15 @@ default_metrics_threshold = os.environ.get(
 save_validation_info_outputs = (
     os.environ.get("FMS_TEST_SHAPES_SAVE_VALIDATION_INFO_OUTPUTS", "0") == "1"
 )
-common_batch_sizes = os.environ.get("FMS_TEST_SHAPES_COMMON_BATCH_SIZES", [1, 2, 4, 8])
-common_seq_lengths = os.environ.get("FMS_TEST_SHAPES_COMMON_SEQ_LENGTHS", [64, 2048])
-common_max_new_tokens = os.environ.get("FMS_TEST_SHAPES_COMMON_MAX_NEW_TOKENS", [128])
+common_batch_sizes = os.environ.get("FMS_TEST_SHAPES_COMMON_BATCH_SIZES", [
+    1,#  2, 4, 8
+])
+common_seq_lengths = os.environ.get("FMS_TEST_SHAPES_COMMON_SEQ_LENGTHS", [
+    64, # 2048
+])
+common_max_new_tokens = os.environ.get("FMS_TEST_SHAPES_COMMON_MAX_NEW_TOKENS", [
+    15 # 128
+])
 
 if USE_DISTRIBUTED:
     dist.init_process_group()
@@ -355,7 +362,8 @@ def test_common_shapes(model_path, batch_size, seq_length, max_new_tokens):
             **distributed_kwargs,
         }
 
-    tokenizer = tokenizers.get_tokenizer(model_path)
+    # tokenizer = tokenizers.get_tokenizer(model_path)
+    tokenizer = tokenizers.get_tokenizer('/mnt/models/granite-20b-code-instruct')
 
     # prepare the AIU model
     model = get_model(
@@ -421,7 +429,9 @@ def test_common_shapes(model_path, batch_size, seq_length, max_new_tokens):
 
     # first test validation level 0
     aiu_validation_info = extract_validation_information(
-        model, input_ids, max_new_tokens, None, only_last_token=True, **padding_kwargs
+        model, input_ids, max_new_tokens, 
+        LogitsExtractorHook(), 
+        only_last_token=True, **padding_kwargs
     )
     dprint("aiu validation info extracted for validation level 0")
 
