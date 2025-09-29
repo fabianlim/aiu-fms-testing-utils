@@ -44,6 +44,7 @@ def generate(
         ]
     ] = None,
     extra_kwargs: Optional[MutableMapping[str, Any]] = None,
+    model_prefill = None,
 ):
     """
     A trivial generate function that can be used for validation/testing in
@@ -293,16 +294,46 @@ def generate(
                         t2._scale = current_kv_scales[layer_idx][1][seq_i].reshape(-1)
 
                 only_last_token = kwargs.get("only_last_token", False)
-                output, current_kv_cache = model(
-                    input_ids_i,
-                    slot_mapping=slot_mapping_i,
-                    position_ids=position_ids_i,
-                    mask=mask_i,
-                    past_key_value_states=current_kv_cache,
-                    use_cache=kwargs["use_cache"],
-                    only_last_token=only_last_token,
-                    attn_name=kwargs["attn_name"],
-                )
+                if not model_prefill:
+                    output, current_kv_cache = model(
+                        input_ids_i,
+                        slot_mapping=slot_mapping_i,
+                        position_ids=position_ids_i,
+                        mask=mask_i,
+                        past_key_value_states=current_kv_cache,
+                        use_cache=kwargs["use_cache"],
+                        only_last_token=only_last_token,
+                        attn_name=kwargs["attn_name"],
+                    )
+                else:
+
+                    # create another oneA (really needed?)
+                    past_key_value_states2 = [
+                        (
+                            torch.zeros(
+                                NUM_BLOCKS, BLOCK_SIZE, kvheads, head_size, dtype=model_dtype
+                            ),
+                            torch.zeros(
+                                NUM_BLOCKS, BLOCK_SIZE, kvheads, head_size, dtype=model_dtype
+                            ),
+                        )
+                        for _ in range(model.config.nlayers)
+                    ]
+                    # run the CPU version
+                    output, cache = model_prefill(
+                        input_ids_i,
+                        position_ids=position_ids_i,
+                        use_cache=True,
+                        only_last_token=only_last_token,
+                    )
+
+                    pas = torch.compile(
+                        fms.utils.spyre.paged.paged_attn_store,
+                        backend="sendnn"
+                    )
+                    for (key, val), (key_store, val_store) in zip(cache, past_key_value_states2):
+
+                        pas(key, val, key_store, val_store, slot_mapping_i)
 
                 # only last token must be handled here to properly stack the tensors
                 if not only_last_token:
@@ -382,6 +413,9 @@ def generate(
             torch._dynamo.mark_dynamic(kwargs["block_table"], 1)
             torch._dynamo.mark_static(kwargs["slot_mapping"], 1)  # always 1
             torch._dynamo.mark_static(kwargs["position_ids"], 1)  # always 1
+
+            if model_prefill:
+                import pdb; pdb.set_trace()
 
             logits, past_key_value_states = model(input_ids, **kwargs)
 

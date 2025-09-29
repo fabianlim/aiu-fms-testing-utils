@@ -339,6 +339,21 @@ model = get_model(
     fused_weights=fused_weights,
 )
 
+# get a validation omdel on cpu
+model_validation = get_model(
+    args.architecture,
+    args.variant,
+    model_path=args.model_path,
+    device_type="cpu",
+    data_type=default_dtype,
+    source=args.model_source,
+    distributed_strategy=distr_param,
+    group=dist.group.WORLD,
+    linear_config=linear_config,
+    fused_weights=fused_weights,
+)
+model_validation.load_state_dict(model.state_dict())
+
 ### Quantization
 
 # FP8 model checks
@@ -545,7 +560,7 @@ def print_result(result, result_idx: int):
     print()
 
 
-def infer(use_cache, do_sample, warmup):
+def infer(use_cache, do_sample, warmup, model_prefill=None):
     # With greedy generation (do_sample=False) we _should_ always get the same results.
     # There is currently a bug in start_pos for batched rotary embeddings that can lead
     # varying results for the same prompt.
@@ -578,6 +593,7 @@ def infer(use_cache, do_sample, warmup):
         timing=args.timing,
         eos_token_id=eos_token_id,
         extra_kwargs=extra_generation_kwargs,
+        model_prefill=model_prefill,
         **attention_specific_kwargs,
     )
     if args.timing != "":
@@ -652,4 +668,4 @@ dprint("generating output")
 
 for sample, cache in itertools.product(do_sample, use_cache):
     for _ in range(args.iters):
-        infer(cache, sample, False)
+        infer(cache, sample, False, model_prefill=model_validation)
