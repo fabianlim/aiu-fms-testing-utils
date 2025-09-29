@@ -63,30 +63,6 @@ parser.add_argument(
     help="Source of the checkpoint. E.g. 'meta', 'hf', None",
 )
 parser.add_argument(
-    "--quantization",
-    type=str,
-    choices=["gptq", "int8"],
-    default=None,
-    help="Type of quantization of the model checkpoint",
-)
-parser.add_argument(
-    "--int8_weight_per_channel",
-    action="store_true",
-    help="Enable per-channel weight quantization in INT8 quantized model",
-)
-parser.add_argument(
-    "--int8_activ_quant_type",
-    default="per_token",
-    choices=["per_token", "per_tensor_symm", "per_tensor_asymm"],
-    type=str,
-    help="Define strategy for activation quantization in INT8 quantized model",
-)
-parser.add_argument(
-    "--int8_smoothquant",
-    action="store_true",
-    help="Enable smoothquant in INT8 quantized model",
-)
-parser.add_argument(
     "--tokenizer",
     type=str,
     required=True,
@@ -235,71 +211,20 @@ parser.add_argument(
 parser.add_argument(
     "--attention_type",
     type=str,
-    choices=["sdpa", "paged", "math_fp8", "paged_fp8"],
+    choices=["paged"],
     default="sdpa",
     help="which backend attention to use in mha",
-)
-parser.add_argument(
-    "--stagger_load",
-    type=int,
-    default=0,
-    help="Limit the number of concurrent processes executing the model loading phase. Set to 0 to allow all processes",
-)
-parser.add_argument(
-    "--stagger_update_lazyhandle",
-    type=int,
-    default=0,
-    help="Limit the number of concurrent processes executing the AIU update_lazyhandle phase. Set to 0 to allow all processes",
-)
-parser.add_argument(
-    "--dist_timeout",
-    type=int,
-    default=0,
-    help="Timeout to use for messaging in minutes. Default set by PyTorch dist.init_process_group",
 )
 args = parser.parse_args()
 
 attention_map = {
-    "sdpa": "sdpa_causal",
     "paged": "spyre_paged_attn",
-    "math_fp8": "math_fp8",
-    "paged_fp8": "spyre_paged_attn_fp8",
 }
 
 attn_name = attention_map[args.attention_type]
 
-if "paged" in attn_name:
-    from aiu_fms_testing_utils.utils.paged import generate
-else:
-    from fms.utils.generation import generate
+from aiu_fms_testing_utils.utils.paged import generate
 
-if "fp8" in attn_name:
-    import fms_mo.aiu_addons.fp8.fp8_attn  # noqa: F401
-
-if args.quantization == "gptq":
-    if "aiu" in args.device_type:
-        try:
-            from fms_mo.aiu_addons.gptq import gptq_aiu_adapter, gptq_aiu_linear  # noqa
-
-            print("Loaded `aiu_addons` functionalities")
-        except ImportError:
-            raise ImportError("Failed to import GPTQ addons from fms-mo.")
-elif args.quantization == "int8":
-    try:
-        from fms_mo.aiu_addons.i8i8 import i8i8_aiu_adapter, i8i8_aiu_linear  # noqa
-
-        print("Loaded `aiu_addons` functionalities")
-    except ImportError:
-        raise ImportError("Failed to import INT8 addons from fms-mo.")
-
-# this is a test model config
-config = LLaMAConfig(
-    emb_dim=1024,
-    nheads=8,
-    nlayers=10,
-    src_vocab_size=128256,
-)
-register_model("llama", "194m", _llama_factory_factory(config))
 
 default_dtype = None
 dtypes_map = {
@@ -317,17 +242,6 @@ dprint(f"{args}")
 
 is_aiu_backend = "aiu" in args.device_type
 
-if args.distributed:
-    if args.dist_timeout > 0:
-        # Default timeout:
-        # https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.init_process_group
-        dist.init_process_group(timeout=datetime.timedelta(minutes=args.dist_timeout))
-        dprint(f"NOTICE: init_process_group timeout set to {args.dist_timeout} minutes")
-    else:
-        dist.init_process_group()
-    # Fix until PT 2.3
-    torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
-    aiu_setup.aiu_dist_setup(dist.get_rank(), dist.get_world_size())
 
 if args.device_type == "cuda":
     device = torch.device(args.device_type, local_rank)
@@ -397,105 +311,13 @@ if args.deterministic:
 
 dprint("loading model")
 loading_model_time = time.time()
-if args.distributed:
-    distr_param = "tp"
+if torch.cuda.device_count() > 1 and world_size == 1:
+    distr_param = "mp"
 else:
-    if torch.cuda.device_count() > 1 and world_size == 1:
-        distr_param = "mp"
-    else:
-        distr_param = None
+    distr_param = None
 
 fused_weights = not args.unfuse_weights
-if args.quantization == "gptq":
-    if fused_weights and is_aiu_backend:
-        raise ValueError(
-            "GPTQ checkpoints on AIU must always run with --unfuse_weights"
-        )
-    if default_dtype is not None:
-        raise ValueError(
-            "GPTQ default_dtype must be None to preserve the checkpoint data types."
-        )
-
-    if "aiu" in args.device_type:
-        linear_type = "gptq_aiu"
-    elif args.device_type == "cpu":
-        linear_type = "gptq_cpu"
-    elif args.device_type == "cuda":
-        linear_type = "gptq"  # GPTQ support on GPU is FMS-native
-    else:
-        raise ValueError(f"Unsupported device {args.device} for GPTQ")
-
-    qconfig_path = args.model_path + "/quantize_config.json"
-    if os.path.exists(qconfig_path):
-        with open(qconfig_path, "r") as f:
-            dprint(f"loading quantization config from {qconfig_path}")
-            qconfig = json.load(f)
-            group_size = qconfig["group_size"]
-            desc_act = qconfig["desc_act"]
-            if desc_act:
-                raise NotImplementedError(
-                    "Activation reordering not supported at this time."
-                )
-    else:
-        dprint(
-            "[WARNING] Could not locate quantization config file. "
-            "Default configuration will be used."
-        )
-        group_size = 128
-        desc_act = False
-
-    linear_config = {
-        "linear_type": linear_type,
-        "group_size": group_size,
-        "desc_act": desc_act,
-    }
-elif args.quantization == "int8":
-    if fused_weights and is_aiu_backend:
-        raise ValueError(
-            "INT8 checkpoints on AIU must always run with --unfuse_weights"
-        )
-    if default_dtype is not None:
-        raise ValueError(
-            "INT8 default_dtype must be None to preserve the checkpoint data types."
-        )
-
-    def select_int8_module(
-        module_name: str | None = None,
-        smoothquant: bool = True,
-        smoothquant_layers: list[str] | None = None,
-    ):
-        if module_name is None:
-            return "int8_aiu"
-        smoothquant_on_module = (
-            any([m in module_name for m in smoothquant_layers])
-            if smoothquant_layers is not None
-            else True
-        )
-        use_smoothquant = smoothquant and smoothquant_on_module
-        return "int8_smoothquant_aiu" if use_smoothquant else "int8_aiu"
-
-    if args.int8_smoothquant:
-        # TODO: consider saving this info into config during quantization
-        if any("granite" in p.lower() for p in [args.model_path, args.architecture]):
-            smoothquant_layers = ["key", "value", "w1", "wg"]
-        elif any("roberta" in p.lower() for p in [args.model_path, args.architecture]):
-            smoothquant_layers = ["query", "key", "value", "w1"]
-        else:
-            raise NotImplementedError("INT8 architecture does not support smoothquant.")
-    else:
-        smoothquant_layers = []
-
-    linear_config = {
-        "linear_type": partial(
-            select_int8_module,
-            smoothquant=args.int8_smoothquant,
-            smoothquant_layers=smoothquant_layers,
-        ),
-        "weight_per_channel": args.int8_weight_per_channel,
-        "activ_quant_type": args.int8_activ_quant_type,
-    }
-else:
-    linear_config = {"linear_type": "torch_linear"}
+linear_config = {"linear_type": "torch_linear"}
 
 dprint("=" * 60)
 dprint(f"model_path={args.model_path}")
@@ -504,43 +326,29 @@ dprint(f"{fused_weights=}")
 dprint(f"data_type={default_dtype}")
 dprint("=" * 60 + "\n")
 
-with stagger_region(args.stagger_load):
-    model = get_model(
-        args.architecture,
-        args.variant,
-        model_path=args.model_path,
-        device_type="cpu" if is_aiu_backend else args.device_type,
-        data_type=default_dtype,
-        source=args.model_source,
-        distributed_strategy=distr_param,
-        group=dist.group.WORLD,
-        linear_config=linear_config,
-        fused_weights=fused_weights,
-    )
+model = get_model(
+    args.architecture,
+    args.variant,
+    model_path=args.model_path,
+    device_type="cpu" if is_aiu_backend else args.device_type,
+    data_type=default_dtype,
+    source=args.model_source,
+    distributed_strategy=distr_param,
+    group=dist.group.WORLD,
+    linear_config=linear_config,
+    fused_weights=fused_weights,
+)
 
 ### Quantization
 
 # FP8 model checks
-has_fp8_weights = False
 has_bf16_weights = False
 has_fp16_weights = False
 for param in model.parameters():
-    if param.dtype == torch.float8_e4m3fn:
-        has_fp8_weights = True
-    elif param.dtype == torch.bfloat16:
+    if param.dtype == torch.bfloat16:
         has_bf16_weights = True
     elif param.dtype == torch.float16:
         has_fp16_weights = True
-
-if has_fp8_weights:
-    if is_aiu_backend and has_bf16_weights and not args.cast_bf16_to_fp16:
-        raise ValueError(
-            "FP8 checkpoints on AIU with bf16 weights require casting to fp16 using --cast_bf16_to_fp16. Do not use --default_dtype!"
-        )
-    elif device.type == "cuda" and has_fp16_weights and not args.cast_fp16_to_bf16:
-        raise ValueError(
-            "FP8 checkpoints on GPU with fp16 weights require casting to bf16 using --cast_fp16_to_bf16. Do not use --default_dtype!"
-        )
 
 if args.cast_bf16_to_fp16:
     for name, param in model.named_parameters():
@@ -556,29 +364,6 @@ if args.cast_fp16_to_bf16:
         if param.dtype == torch.float16:
             param.data = param.data.to(dtype=torch.bfloat16)
 
-if args.quantization in ["gptq", "int8"]:
-    if rank == 0 and args.verbose > 0:
-        dprint(
-            "PARAMS:\n"
-            + "\n".join(
-                f"{k:60} {str(v.dtype):15} {str(v.device):10} {list(v.size())}"
-                for k, v in model.named_parameters()
-            )
-        )
-        dprint(
-            "BUFFERS:\n"
-            + "\n".join(
-                f"{k:60} {str(v.dtype):15} {str(v.device):10} {list(v.size())}"
-                for k, v in model.named_buffers()
-            )
-        )
-        dprint("=" * 60 + "\n")
-    if args.architecture == "llama":
-        dprint(
-            "[NOTE] In Llama models, it's OK for bias and rotary embeddings to be marked as unused keys."
-        )
-    dprint(model)
-    dprint("=" * 60 + "\n")
 
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 model.eval()
@@ -685,7 +470,8 @@ else:
     prompt2 = tokenizer.encode(prompt2, return_tensors="pt").squeeze(0)
     prompt3 = tokenizer.encode(prompt3, return_tensors="pt").squeeze(0)
     prompt4 = tokenizer.encode(prompt4, return_tensors="pt").squeeze(0)
-    prompts = [prompt1, prompt2, prompt3, prompt4]
+    # prompts = [prompt1, prompt2, prompt3, prompt4]
+    prompts = [prompt1]
     prompts = prompts * ((args.batch_size // 4) + 1)
     prompts = prompts[: args.batch_size]
 
@@ -843,7 +629,7 @@ if args.compile:
                 args.max_new_tokens,
                 args.compile_dynamic_sendnn,
                 use_cache=cache,
-                stagger_update_lazyhandle=args.stagger_update_lazyhandle,
+                stagger_update_lazyhandle=0,
                 **extra_generation_kwargs,
             )
         if (
