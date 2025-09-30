@@ -487,7 +487,7 @@ else:
     prompt4 = tokenizer.encode(prompt4, return_tensors="pt").squeeze(0)
     # prompts = [prompt1, prompt2, prompt3, prompt4]
     prompts = [prompt1]
-    prompts = prompts * ((args.batch_size // 4) + 1)
+    # prompts = prompts * ((args.batch_size // 4) + 1)
     prompts = prompts[: args.batch_size]
 
 if args.fixed_prompt_length != 0:
@@ -536,6 +536,7 @@ if "paged" in attn_name:
 
 
 def print_result(result, result_idx: int):
+
     if local_rank != 0:
         return
     if has_padding:
@@ -560,7 +561,7 @@ def print_result(result, result_idx: int):
     print()
 
 
-def infer(use_cache, do_sample, warmup, model_prefill=None):
+def infer(use_cache, do_sample, warmup, model_prefill=None, custom_prompts=None, pkvs=None):
     # With greedy generation (do_sample=False) we _should_ always get the same results.
     # There is currently a bug in start_pos for batched rotary embeddings that can lead
     # varying results for the same prompt.
@@ -568,8 +569,20 @@ def infer(use_cache, do_sample, warmup, model_prefill=None):
         dprint(f"use_cache {use_cache};; do_sample {do_sample}")
         dprint("==================")
 
+    global extra_generation_kwargs, ids
+
+    if custom_prompts is not None:
+        # make some new prompts
+        prompts = truncate_prompts_to_max_length(custom_prompts, max_len, max_allowed_length)
+        if has_padding:
+            ids, _extra_generation_kwargs = pad_input_ids(prompts, min_pad_length=padding_length)
+            extra_generation_kwargs.update(_extra_generation_kwargs)
+        else:
+            ids = prompts
+            if isinstance(ids, list) and len(ids) == 1:
+                ids = ids[0].unsqueeze(0)
+
     # Add only_last_token optimization
-    global extra_generation_kwargs
     if extra_generation_kwargs is None:
         extra_generation_kwargs = {}
     extra_generation_kwargs["only_last_token"] = "paged" not in attn_name
@@ -584,7 +597,7 @@ def infer(use_cache, do_sample, warmup, model_prefill=None):
         attention_specific_kwargs["contiguous_cache"] = True
         attention_specific_kwargs["max_seq_len"] = ids.shape[1] + args.max_new_tokens
 
-    result = generate(
+    result, pkvs = generate(
         model,
         ids,
         max_new_tokens=args.max_new_tokens,
@@ -594,6 +607,7 @@ def infer(use_cache, do_sample, warmup, model_prefill=None):
         eos_token_id=eos_token_id,
         extra_kwargs=extra_generation_kwargs,
         model_prefill=model_prefill,
+        pkvs=pkvs,
         **attention_specific_kwargs,
     )
     if args.timing != "":
@@ -628,6 +642,8 @@ def infer(use_cache, do_sample, warmup, model_prefill=None):
         for i in range(result.shape[0]):
             print_result(result[i], i)
 
+    return pkvs
+
 
 do_sample = [False]
 use_cache = [
@@ -653,7 +669,7 @@ if args.compile:
         ):  # run device initialization warmup for AIU, skip for senulator
             aiu_warmup_time = time.time()
             for sample, cache in itertools.product(do_sample, use_cache):
-                infer(cache, sample, True)
+                pkvs = infer(cache, sample, True)
             aiu_warmup_time = time.time() - aiu_warmup_time
             dprint(
                 f"AIU device initialization warmup complete, took {aiu_warmup_time:.3f}s"
@@ -666,6 +682,17 @@ if args.compile:
 
 dprint("generating output")
 
+
 for sample, cache in itertools.product(do_sample, use_cache):
     for _ in range(args.iters):
-        infer(cache, sample, False, model_prefill=model_validation)
+        # infer(cache, sample, False)
+        infer(cache, sample, False, 
+                model_prefill=model_validation, 
+                custom_prompts=[
+                 tokenizer.encode(x, return_tensors="pt").squeeze(0)
+                  for x in [
+                      'you have never seen this prompt before'
+                    ]
+                ],
+                pkvs=pkvs
+            )
