@@ -307,18 +307,6 @@ def generate(
                     )
                 else:
 
-                    # create another oneA (really needed?)
-                    past_key_value_states2 = [
-                        (
-                            torch.zeros(
-                                NUM_BLOCKS, BLOCK_SIZE, kvheads, head_size, dtype=model_dtype
-                            ),
-                            torch.zeros(
-                                NUM_BLOCKS, BLOCK_SIZE, kvheads, head_size, dtype=model_dtype
-                            ),
-                        )
-                        for _ in range(model.config.nlayers)
-                    ]
                     # run the CPU version
                     output, cache = model_prefill(
                         input_ids_i,
@@ -335,13 +323,13 @@ def generate(
                     )
                     import torch.nn.functional as F
 
-                    for (key, val), (key_store, val_store) in zip(cache, past_key_value_states2):
+                    for (key, val), (key_store, val_store) in zip(cache, current_kv_cache):
 
-                        key = F.pad(key, (0, 0, 0, 0, 56, 0), 'constant', 0.0)
-                        val = F.pad(val, (0, 0, 0, 0, 56, 0), 'constant', 0.0)
-                        key = key[..., ::8,:]
-                        val = val[..., ::8,:]
-                        pas(key, val, key_store, val_store, slot_mapping_i)
+                        # key = F.pad(key, (0, 0, 0, 0, 56, 0), 'constant', 0.0)
+                        # val = F.pad(val, (0, 0, 0, 0, 56, 0), 'constant', 0.0)
+                        # key = key[..., ::8,:]
+                        # val = val[..., ::8,:]
+                        pas(key.transpose(1, 2), val.transpose(1, 2), key_store, val_store, slot_mapping_i)
 
                 # only last token must be handled here to properly stack the tensors
                 # only last token must be handled here to properly stack the tensors
