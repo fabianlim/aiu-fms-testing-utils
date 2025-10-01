@@ -45,6 +45,7 @@ def generate(
     ] = None,
     extra_kwargs: Optional[MutableMapping[str, Any]] = None,
     model_prefill = None,
+    pkvs = None
 ):
     """
     A trivial generate function that can be used for validation/testing in
@@ -180,6 +181,8 @@ def generate(
             )
             for _ in range(model.config.nlayers)
         ]
+    elif pkvs is not None:
+        kwargs["past_key_value_states"] = pkvs
     else:
         kwargs["past_key_value_states"] = [
             (
@@ -315,21 +318,36 @@ def generate(
                         only_last_token=only_last_token,
                     )
 
+                    from aiu_fms_testing_utils.utils.aiu_setup import dprint
+
+                    dprint("Compiling paged_attn_store")
+                    _old_val = os.environ['COMPILATION_MODE'] 
                     os.environ['COMPILATION_MODE'] = 'offline'
 
                     pas = torch.compile(
                         fms.utils.spyre.paged.paged_attn_store,
                         backend="sendnn"
                     )
+
                     import torch.nn.functional as F
 
+                    new_kv_cache = []
                     for (key, val), (key_store, val_store) in zip(cache, current_kv_cache):
 
-                        # key = F.pad(key, (0, 0, 0, 0, 56, 0), 'constant', 0.0)
-                        # val = F.pad(val, (0, 0, 0, 0, 56, 0), 'constant', 0.0)
-                        # key = key[..., ::8,:]
-                        # val = val[..., ::8,:]
-                        pas(key.transpose(1, 2), val.transpose(1, 2), key_store, val_store, slot_mapping_i)
+                        kvs, vvs = pas(
+                            key.transpose(1, 2), val.transpose(1, 2), 
+                            key_store, val_store, 
+                            slot_mapping_i
+                        )
+                        dprint(f"kvs updated from {id(key_store)} to {id(kvs)}")
+                        new_kv_cache.append((kvs, vvs))
+
+                    current_kv_cache = new_kv_cache
+
+                    os.environ['COMPILATION_MODE'] = _old_val
+
+
+                    # kwargs['past_key_value_states'] = updated_key_val_cache
 
                 # only last token must be handled here to properly stack the tensors
                 # only last token must be handled here to properly stack the tensors
@@ -492,7 +510,7 @@ def generate(
 
     if timing != "":
         return result, times
-    return result
+    return result, past_key_value_states
 
 
 # this value is default to 2080 to be consistent with vllm for granite 3.3 8b instruct
